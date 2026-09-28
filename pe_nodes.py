@@ -79,7 +79,7 @@ class QwenPERewrite:
                 "edit_model": (models, {"default": DEFAULT_EDIT if DEFAULT_EDIT in models else models[0]}),
                 "vision_model": (_choices(True), {"default": "Auto"}),
                 "model_lifetime": (["after_run", "keep_loaded"], {"default": "after_run"}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0x7FFFFFFF}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": images,
         }
@@ -185,7 +185,8 @@ class QwenPERewrite:
                 load_seconds = time.monotonic() - load_started
                 log_state["gen_started"] = time.monotonic()
                 logger.info("[Qwen PE] 模型就绪 (%.1fs)，开始生成提示词…", load_seconds)
-                answer, info = SERVER.complete(actual_task, user_prompt, encoded, seed, 900,
+                # ComfyUI seeds reach 2**64-1 but llama.cpp only takes 32 bits.
+                answer, info = SERVER.complete(actual_task, user_prompt, encoded, seed & 0xFFFFFFFF, 900,
                                                on_token=on_token,
                                                output_language=output_language,
                                                aspect_ratio=aspect_ratio,
