@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -7,8 +8,20 @@ import time
 
 import torch
 
+import comfy.utils
+
 from .pe_runtime import (DEFAULT_EDIT, DEFAULT_T2I, SERVER, file_signature, local_models,
                          pick_mmproj, prepare_images, quoted_literals, resolve_model, strip_quoted_literals)
+
+
+# Prompt generation runs for minutes with no other sign of life, so report
+# long steps to both the ComfyUI console and the node progress bar. llama.cpp
+# streams one chunk per token but only reports a real total at the end, so the
+# bar starts small and grows until the generation halts.
+PROGRESS_START_TOTAL = 2048        # roughly a short rewrite
+PROGRESS_GROW_STEP = 2048          # extend by this much when the model runs on
+PROGRESS_MAX_TOTAL = 24000         # the edit branch's max_tokens
+PROGRESS_LOG_INTERVAL = 5.0        # seconds between console lines
 
 
 ASPECT_RATIOS = ["auto", "1:1", "1:2", "2:3", "3:4", "4:5", "16:9",
@@ -134,14 +147,64 @@ class QwenPERewrite:
         except ImportError:
             pass
         started = time.monotonic()
+        logger = logging.getLogger("qwen_pe")
+        progress = comfy.utils.ProgressBar(PROGRESS_START_TOTAL)
+        log_state = {"tokens": 0, "last": 0.0, "gen_started": None}
+
+        def on_token(_text, usage=None):
+            reported = usage or {}
+            total_tokens = reported.get("completion_tokens")
+            if "chunks" in reported:
+                # streaming: one chunk per token, no running total yet
+                total = progress.total
+                if total_tokens is None or total_tokens > total:
+                    total = min(PROGRESS_MAX_TOTAL, max(PROGRESS_START_TOTAL,
+                                                        total + PROGRESS_GROW_STEP))
+                log_state["tokens"] = total_tokens if total_tokens is not None else log_state["tokens"] + 1
+                progress.update_absolute(log_state["tokens"], total=total)
+            else:
+                log_state["tokens"] = total_tokens if total_tokens is not None else log_state["tokens"] + 1
+                total = progress.total
+                if log_state["tokens"] > total:
+                    total = min(PROGRESS_MAX_TOTAL, max(PROGRESS_START_TOTAL, log_state["tokens"]))
+                progress.update_absolute(min(log_state["tokens"], total), total=total)
+            now = time.monotonic()
+            if now - log_state["last"] >= PROGRESS_LOG_INTERVAL:
+                log_state["last"] = now
+                logger.info("[Qwen PE] 生成中: 约 %d tokens (%.0fs)",
+                            log_state["tokens"], now - started)
+
+        logger.info("[Qwen PE] 任务=%s 模型=%s 图片=%d 上下文=%d (%.1fs 预处理)",
+                    actual_task, Path(model_name).name, len(images), context,
+                    time.monotonic() - started)
         with SERVER.lock:
             try:
+                logger.info("[Qwen PE] 启动 llama-server 并加载模型…")
+                load_started = time.monotonic()
                 SERVER.start(model, mmproj, context, 99)
+                load_seconds = time.monotonic() - load_started
+                log_state["gen_started"] = time.monotonic()
+                logger.info("[Qwen PE] 模型就绪 (%.1fs)，开始生成提示词…", load_seconds)
                 answer, info = SERVER.complete(actual_task, user_prompt, encoded, seed, 900,
-                                               output_language, aspect_ratio, transparent_rgba)
+                                               on_token=on_token,
+                                               output_language=output_language,
+                                               aspect_ratio=aspect_ratio,
+                                               transparent_rgba=transparent_rgba)
             finally:
                 if model_lifetime == "after_run":
                     SERVER.stop()
+        usage = (info or {}).get("usage") or {}
+        elapsed = time.monotonic() - started
+        gen_seconds = elapsed - (log_state["gen_started"] - started if log_state["gen_started"] else 0)
+        if usage.get("chunks"):
+            logger.info("[Qwen PE] 生成结束: %d tokens, %.1f tok/s, finish_reason=%s, 总耗时 %.1fs",
+                        usage["chunks"], usage["chunks"] / max(gen_seconds, 1e-6),
+                        (info or {}).get("finish_reason"), elapsed)
+        else:
+            logger.info("[Qwen PE] 生成结束: finish_reason=%s, 总耗时 %.1fs",
+                        (info or {}).get("finish_reason"), elapsed)
+        if progress.total > 0:
+            progress.update_absolute(progress.total, total=progress.total)
         model_wh_ratio = answer["wh_ratio"]
         model_ratio_follow = answer.get("ratio_follow", "")
         if aspect_ratio != "auto":

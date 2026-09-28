@@ -2,6 +2,7 @@ import atexit
 import base64
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -512,7 +513,7 @@ class LocalServer:
                 self.stop()
                 raise
 
-    def complete(self, task, prompt, images, seed, timeout,
+    def complete(self, task, prompt, images, seed, timeout, on_token=None,
                  output_language="auto", aspect_ratio="auto", transparent_rgba=False):
         with self.lock:
             exact_literals = set(quoted_literals(prompt))
@@ -570,12 +571,13 @@ class LocalServer:
                 "max_tokens": 16256 if task == "t2i" else 24000,
                 "seed": seed,
                 "chat_template_kwargs": {"enable_thinking": True},
-                "stream": False,
+                "stream": True,
             }
             first_error = None
             truncation_retry = False
             for attempt in range(2):
-                result = self._post_completion(payload, timeout)
+                result = self._post_completion(payload, timeout,
+                                               on_token=on_token if attempt == 0 else None)
                 choice = result["choices"][0]
                 if choice.get("finish_reason") == "length":
                     usage = result.get("usage") or {}
@@ -704,17 +706,76 @@ class LocalServer:
             raise ValueError("translation fallback returned empty text")
         return translated, result.get("usage", {})
 
-    def _post_completion(self, payload, timeout):
-        """Wait for llama.cpp while honoring ComfyUI's interrupt flag."""
+    def _post_completion(self, payload, timeout, on_token=None):
+        """Wait for llama.cpp while honoring ComfyUI's interrupt flag.
+
+        on_token(text, usage) is called as streamed chunks arrive so callers can
+        report live progress; it never raises into the request thread.
+        """
         request = Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                           data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                           headers={"Content-Type": "application/json"}, method="POST")
         outcome = {}
+        streaming = bool(payload.get("stream"))
+        pieces = []
+        stream_usage = {}
+        stream_finish = None
+        state = {"count": 0}
+
+        def note(text, usage=None):
+            if on_token is None:
+                return
+            try:
+                on_token(text, usage)
+            except Exception:
+                logging.debug("qwen-pe progress callback failed", exc_info=True)
+
+        def consume_line(line):
+            nonlocal stream_finish
+            if not line.startswith(b"data:"):
+                return
+            data = line[5:].strip()
+            if not data or data == b"[DONE]":
+                return
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                return
+            if isinstance(chunk.get("usage"), dict):
+                stream_usage.update(chunk["usage"])
+            choices = chunk.get("choices") or []
+            if not choices:
+                return
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                stream_finish = choice["finish_reason"]
+            delta = choice.get("delta") or choice.get("message") or {}
+            text = delta.get("content")
+            if not text:
+                return
+            pieces.append(text)
+            state["count"] += 1
+            note(text, stream_usage if stream_usage else None)
 
         def perform():
             try:
                 with urlopen(request, timeout=timeout) as response:
-                    outcome["result"] = json.load(response)
+                    if streaming:
+                        for line in response:
+                            consume_line(line)
+                        content = "".join(pieces)
+                        # llama.cpp reports usage only in the terminal chunk, and only
+                        # for the final answer segment, so it under-reports the reply.
+                        # The stream itself is one chunk per token: that count is exact.
+                        usage = dict(stream_usage)
+                        usage["chunks"] = state["count"]
+                        outcome["result"] = {
+                            "choices": [{"message": {"content": content},
+                                         "finish_reason": stream_finish or "stop"}],
+                            "usage": usage,
+                        }
+                    else:
+                        outcome["result"] = json.load(response)
             except HTTPError as exc:
                 detail = exc.read(2000).decode("utf-8", "replace")
                 outcome["error"] = RuntimeError(f"llama-server HTTP {exc.code}: {detail}")
