@@ -60,15 +60,44 @@ def _choices(vision=False):
     return names or ["(no local GGUF found)"]
 
 
+def _extract_thinking(raw):
+    """Pull the reasoning block out of the raw model answer, if it emitted one."""
+    match = re.search(r"<think>([\s\S]*?)</think>", raw or "")
+    return (match.group(1).strip() if match else "")
+
+
+def _as_image_list(image):
+    """Split one Comfy IMAGE batch into the single-image tensors prepare_images wants."""
+    if image is None:
+        return []
+    if not torch.is_tensor(image) or image.ndim != 4 or image.shape[-1] not in (3, 4):
+        raise ValueError("image must be a ComfyUI IMAGE (B,H,W,3|4)")
+    if image.shape[0] < 1:
+        raise ValueError("image batch is empty")
+    if image.shape[0] > 10:
+        raise ValueError("At most 10 reference images are supported")
+    return [image[index:index + 1] for index in range(image.shape[0])]
+
+
 class QwenPERewrite:
     @classmethod
     def INPUT_TYPES(cls):
         models = _choices()
-        images = {f"image_{i}": ("IMAGE",) for i in range(1, 11)}
         return {
             "required": {
-                "user_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "prompt": ("STRING", {"multiline": True, "default": "", "dynamic_prompts": True}),
                 "task": (["auto", "t2i", "edit"], {"default": "auto"}),
+                "max_length": ("INT", {"default": 24000, "min": 1, "max": 32768,
+                                       "tooltip": "生成长度上限。思考块也算在内，截断会自动关掉思考重试一次。"}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 2.0, "step": 0.000001}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 1000}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 0.0, "max": 5.0, "step": 0.01}),
+                "presence_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 5.0, "step": 0.01}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "thinking": ("BOOLEAN", {"default": True,
+                                         "tooltip": "官方 PE 依赖思考块；关掉更快但改写质量可能下降。"}),
                 "aspect_ratio": (ASPECT_RATIOS, {"default": "auto",
                                                  "tooltip": "auto 使用模型建议；指定比例将覆盖模型比例并控制 Canvas。"}),
                 "output_language": (["auto", "中文", "English"], {"default": "auto",
@@ -79,13 +108,16 @@ class QwenPERewrite:
                 "edit_model": (models, {"default": DEFAULT_EDIT if DEFAULT_EDIT in models else models[0]}),
                 "vision_model": (_choices(True), {"default": "Auto"}),
                 "model_lifetime": (["after_run", "keep_loaded"], {"default": "after_run"}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             },
-            "optional": images,
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "参考图。batch 会按顺序拆成 <image1>、<image2>…"}),
+                "system_prompt": ("STRING", {"multiline": True, "force_input": True,
+                                             "tooltip": "替换内置的 prompts/system_prompt_*.txt。"}),
+            },
         }
 
-    RETURN_TYPES = ("STRING", "PE_RESULT", "STRING")
-    RETURN_NAMES = ("rewritten_prompt", "pe_result", "diagnostics")
+    RETURN_TYPES = ("STRING", "STRING", "PE_RESULT", "STRING")
+    RETURN_NAMES = ("generated_text", "thinking", "pe_result", "diagnostics")
     FUNCTION = "rewrite"
     CATEGORY = "Qwen Image 2.1/Prompt Rewrite"
 
@@ -120,15 +152,14 @@ class QwenPERewrite:
                 fingerprint.update(repr(file_signature(path)).encode())
         return fingerprint.hexdigest()
 
-    def rewrite(self, user_prompt, task, aspect_ratio, output_language, transparent_rgba,
-                t2i_model, edit_model, vision_model,
-                model_lifetime, seed, **kwargs):
-        if not user_prompt.strip():
+    def rewrite(self, prompt, task, max_length, temperature, top_k, top_p, min_p,
+                repetition_penalty, presence_penalty, seed, thinking,
+                aspect_ratio, output_language, transparent_rgba,
+                t2i_model, edit_model, vision_model, model_lifetime,
+                image=None, system_prompt=None):
+        if not prompt.strip():
             raise ValueError("Enter a text instruction; image-only requests need an explicit editing goal")
-        present = sorted((int(key.split("_")[-1]), value) for key, value in kwargs.items() if value is not None)
-        images = [value for _, value in present]
-        if len(images) > 10:
-            raise ValueError("At most 10 reference images are supported")
+        images = _as_image_list(image)
         actual_task = ("edit" if images else "t2i") if task == "auto" else task
         if actual_task == "edit" and not images:
             raise ValueError("edit requires at least one image")
@@ -186,11 +217,17 @@ class QwenPERewrite:
                 log_state["gen_started"] = time.monotonic()
                 logger.info("[Qwen PE] 模型就绪 (%.1fs)，开始生成提示词…", load_seconds)
                 # ComfyUI seeds reach 2**64-1 but llama.cpp only takes 32 bits.
-                answer, info = SERVER.complete(actual_task, user_prompt, encoded, seed & 0xFFFFFFFF, 900,
+                answer, info = SERVER.complete(actual_task, prompt, encoded, seed & 0xFFFFFFFF, 900,
                                                on_token=on_token,
                                                output_language=output_language,
                                                aspect_ratio=aspect_ratio,
-                                               transparent_rgba=transparent_rgba)
+                                               transparent_rgba=transparent_rgba,
+                                               system_prompt=system_prompt or None,
+                                               max_tokens=max_length,
+                                               temperature=temperature, top_k=top_k, top_p=top_p,
+                                               min_p=min_p, repetition_penalty=repetition_penalty,
+                                               presence_penalty=presence_penalty,
+                                               thinking=thinking)
             finally:
                 if model_lifetime == "after_run":
                     SERVER.stop()
@@ -211,13 +248,21 @@ class QwenPERewrite:
         if aspect_ratio != "auto":
             answer["wh_ratio"] = aspect_ratio
             answer["ratio_follow"] = ""
-        language = _resolved_language(output_language, answer["rewritten_prompt"], user_prompt)
+        language = _resolved_language(output_language, answer["rewritten_prompt"], prompt)
         final_prompt = _format_prompt(answer["rewritten_prompt"], transparent_rgba, language)
         template_name = "system_prompt_t2i.txt" if actual_task == "t2i" else "system_prompt_edit.txt"
-        template_hash = hashlib.sha256((Path(__file__).resolve().parent / "prompts" / template_name).read_bytes()).hexdigest()
+        if system_prompt and system_prompt.strip():
+            system_prompt_sha256 = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+            system_prompt_source = "input"
+        else:
+            system_prompt_sha256 = hashlib.sha256(
+                (Path(__file__).resolve().parent / "prompts" / template_name).read_bytes()).hexdigest()
+            system_prompt_source = template_name
+        reasoning = _extract_thinking(info.get("raw_output") or "")
         result = {
             "task": actual_task,
             "rewritten_prompt": final_prompt,
+            "thinking": reasoning,
             "wh_ratio": answer["wh_ratio"],
             "ratio_follow": answer.get("ratio_follow", ""),
             "model_wh_ratio": model_wh_ratio,
@@ -226,11 +271,15 @@ class QwenPERewrite:
             "output_language": language,
             "transparent_rgba": transparent_rgba,
             "image_dimensions": dimensions,
-            "image_input_ports": [f"image_{index}" for index, _ in present],
+            "image_count": len(images),
             "image_fingerprints": image_fingerprints,
             "model": model.name,
             "mmproj": mmproj.name if mmproj else "",
-            "system_prompt_sha256": template_hash,
+            "system_prompt_sha256": system_prompt_sha256,
+            "system_prompt_source": system_prompt_source,
+            "sampling": {"max_length": max_length, "temperature": temperature, "top_k": top_k,
+                         "top_p": top_p, "min_p": min_p, "repetition_penalty": repetition_penalty,
+                         "presence_penalty": presence_penalty, "thinking": thinking},
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "seed": seed,
             "finish_reason": info["finish_reason"],
@@ -245,9 +294,10 @@ class QwenPERewrite:
             "translation_fallback": info.get("translation_fallback", False),
             "translation_usage": info.get("translation_usage"),
         }
-        diagnostics = json.dumps({key: value for key, value in result.items() if key != "rewritten_prompt"},
+        diagnostics = json.dumps({key: value for key, value in result.items()
+                                  if key not in ("rewritten_prompt", "thinking")},
                                  ensure_ascii=False)
-        return result["rewritten_prompt"], result, diagnostics
+        return result["rewritten_prompt"], reasoning, result, diagnostics
 
 
 class QwenPECanvas:
