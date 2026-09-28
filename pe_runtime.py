@@ -514,9 +514,7 @@ class LocalServer:
                 raise
 
     def complete(self, task, prompt, images, seed, timeout, on_token=None,
-                 output_language="auto", aspect_ratio="auto", transparent_rgba=False,
-                 system_prompt=None, max_tokens=None, temperature=1.0, top_k=20, top_p=0.95,
-                 min_p=0.0, repetition_penalty=1.05, presence_penalty=None, thinking=True):
+                 output_language="auto", aspect_ratio="auto", transparent_rgba=False):
         with self.lock:
             exact_literals = set(quoted_literals(prompt))
             if task == "edit":
@@ -525,10 +523,7 @@ class LocalServer:
                 exact_literals = {value for value in exact_literals
                                   if not re.fullmatch(r"<image\d+>", value)}
             system_name = "system_prompt_t2i.txt" if task == "t2i" else "system_prompt_edit.txt"
-            if system_prompt and system_prompt.strip():
-                system = system_prompt.strip()
-            else:
-                system = (ROOT / "prompts" / system_name).read_text(encoding="utf-8").strip()
+            system = (ROOT / "prompts" / system_name).read_text(encoding="utf-8").strip()
             content = [{"type": "image_url", "image_url": {"url": value}} for value in images]
             if not images:
                 reference_rule = ("There are no input images. Do not write <image>, "
@@ -565,21 +560,17 @@ class LocalServer:
             else:
                 presented_prompt = prompt
             content.append({"type": "text", "text": presented_prompt})
-            effective_presence = presence_penalty
-            if effective_presence is None:
-                effective_presence = 1.5 if task == "t2i" else 0.0
             payload = {
                 "model": "qwen-pe",
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "repetition_penalty": repetition_penalty,
-                "presence_penalty": effective_presence,
-                "max_tokens": int(max_tokens) if max_tokens else (16256 if task == "t2i" else 24000),
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 1.5 if task == "t2i" else 0.0,
+                "max_tokens": 16256 if task == "t2i" else 24000,
                 "seed": seed,
-                "chat_template_kwargs": {"enable_thinking": bool(thinking)},
+                "chat_template_kwargs": {"enable_thinking": True},
                 "stream": True,
             }
             first_error = None
@@ -658,7 +649,6 @@ class LocalServer:
                     validate_mode(answer, aspect_ratio, transparent_rgba, exact_literals)
                     return answer, {"finish_reason": choice.get("finish_reason"),
                                     "usage": result.get("usage", {}),
-                                    "raw_output": raw,
                                     "format_retries": attempt, "first_format_error": first_error,
                                     "truncation_retry": truncation_retry,
                                     "normalized_single_image_tags": normalized_single_image_tags,
