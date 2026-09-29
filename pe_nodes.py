@@ -321,6 +321,9 @@ class QwenPECanvas:
             index = int(follow.removeprefix("<image").removesuffix(">")) - 1
             width, height = pe_result["image_dimensions"][index]
             source = follow
+        elif not pe_result["wh_ratio"]:
+            raise ValueError("the rewrite produced no aspect ratio; set one in the rewrite node "
+                             "or use a JSON-format system prompt")
         else:
             left, right = map(int, pe_result["wh_ratio"].split(":"))
             ratio = left / right

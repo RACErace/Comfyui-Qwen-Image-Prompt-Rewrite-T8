@@ -205,9 +205,17 @@ def prepare_images(images):
     return result, dimensions
 
 
-def parse_answer(raw, task, image_count):
+def _expects_json(raw):
+    """A failed parse is a broken JSON answer rather than prose that contains braces."""
+    return '"rewritten_prompt"' in raw or bool(
+        re.match(r"\s*[{\[]", re.sub(r"<think>[\s\S]*?</think>", "", raw)))
+
+
+def json_values(raw):
+    """Every top-level JSON value in the reply, in order."""
     decoder = json.JSONDecoder()
     parsed = []
+    expects_json = _expects_json(raw)
     cursor = 0
     while cursor < len(raw):
         if raw.startswith("<think>", cursor):
@@ -224,11 +232,45 @@ def parse_answer(raw, task, image_count):
         try:
             candidate, end = decoder.raw_decode(raw[cursor:])
         except json.JSONDecodeError as exc:
-            raise ValueError("model returned malformed top-level JSON") from exc
+            if expects_json:
+                raise ValueError("model returned malformed top-level JSON") from exc
+            cursor += 1
+            continue
         parsed.append(candidate)
         cursor += end
-    if not parsed or not isinstance(parsed[-1], dict):
-        raise ValueError("model did not return a valid final JSON object")
+    return parsed
+
+
+def plain_text_answer(raw):
+    """The reply as prose, with reasoning blocks and a wrapping code fence removed."""
+    text = raw
+    while True:
+        start = text.find("<think>")
+        if start < 0:
+            break
+        end = text.find("</think>", start)
+        if end < 0:
+            raise ValueError("model returned an incomplete thinking block")
+        text = text[:start] + text[end + len("</think>"):]
+    if "</think>" in text:
+        raise ValueError("model returned an unmatched thinking block close")
+    text = re.sub(r"^\s*```[A-Za-z0-9_+-]*\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def parse_answer(raw, task, image_count):
+    parsed = json_values(raw)
+    if not parsed:
+        prose = plain_text_answer(raw)
+        if not prose:
+            raise ValueError("model returned neither a JSON answer nor a description")
+        # A plain-text system prompt has no ratio field to fill, so the
+        # aspect_ratio widget stays the only ratio source; QwenPECanvasT8
+        # reports the missing ratio instead of failing inside int().
+        return {"rewritten_prompt": prose, "wh_ratio": "", "ratio_follow": ""}
+    if not isinstance(parsed[-1], dict):
+        raise ValueError("model returned a trailing value that is not a JSON object")
     answer = parsed[-1]
     required = {"rewritten_prompt", "wh_ratio"} if task == "t2i" else {"rewritten_prompt", "wh_ratio", "ratio_follow"}
     if set(answer) != required:
@@ -608,7 +650,7 @@ class LocalServer:
                     payload["chat_template_kwargs"] = {"enable_thinking": False}
                     payload["messages"][0]["content"] = (
                         system + "\n\nThe previous response was truncated. Return only the final "
-                        "JSON object with the required fields; do not include reasoning or commentary.")
+                        "answer in the format specified above; do not include reasoning or commentary.")
                     continue
                 raw = choice["message"].get("content") or ""
                 try:
@@ -669,12 +711,15 @@ class LocalServer:
                                     "translation_usage": translation_usage}
                 except ValueError as exc:
                     if attempt:
-                        raise ValueError(f"model failed format validation after one retry: {exc}") from exc
+                        raise ValueError(
+                            f"model failed format validation after one retry: {exc}\n"
+                            f"RAW MODEL OUTPUT:\n{raw}"
+                        ) from exc
                     first_error = str(exc)
                     system += ("\n\nThe previous output failed validation: " + first_error +
-                               ". Retry the same user request and satisfy all JSON, language, "
-                               "aspect-ratio, and image-reference constraints. " +
-                               reference_rule + " Return only the final JSON object, "
+                               ". Retry the same user request and satisfy the output format, "
+                               "language, aspect-ratio, and image-reference constraints. " +
+                               reference_rule + " Return only the final answer, "
                                "without reasoning or commentary.")
                     payload["messages"][0]["content"] = system
                     payload["chat_template_kwargs"] = {"enable_thinking": False}
