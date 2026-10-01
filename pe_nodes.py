@@ -181,9 +181,26 @@ class QwenPERewrite:
         logger = logging.getLogger("qwen_pe")
         progress = comfy.utils.ProgressBar(PROGRESS_START_TOTAL)
         log_state = {"tokens": 0, "last": 0.0, "gen_started": None}
+        stream = {"pending": "", "thinking": True}
 
-        def on_token(_text, usage=None):
+        def _emit_lines():
+            """Print whole lines of the model's own output as they stream in."""
+            while "\n" in stream["pending"]:
+                line, stream["pending"] = stream["pending"].split("\n", 1)
+                text = line.replace("<think>", "").replace("</think>", "").rstrip()
+                if text.strip():
+                    logger.info("%s %s",
+                                "[Qwen PE think]" if stream["thinking"] else "[Qwen PE 内容]", text)
+
+        def on_token(text, usage=None):
             reported = usage or {}
+            if text:
+                stream["pending"] += text
+                # llama.cpp runs with --reasoning-format none, so the chain of
+                # thought arrives inline; </think> marks where the answer starts.
+                if stream["thinking"] and "</think>" in stream["pending"]:
+                    stream["thinking"] = False
+                _emit_lines()
             total_tokens = reported.get("completion_tokens")
             if "chunks" in reported:
                 # streaming: one chunk per token, no running total yet
@@ -231,6 +248,11 @@ class QwenPERewrite:
             finally:
                 if model_lifetime == "after_run":
                     SERVER.stop()
+        if stream["pending"].strip():
+            logger.info("%s %s",
+                        "[Qwen PE think]" if stream["thinking"] else "[Qwen PE 内容]",
+                        stream["pending"].replace("<think>", "").replace("</think>", "").rstrip())
+            stream["pending"] = ""
         usage = (info or {}).get("usage") or {}
         elapsed = time.monotonic() - started
         gen_seconds = elapsed - (log_state["gen_started"] - started if log_state["gen_started"] else 0)

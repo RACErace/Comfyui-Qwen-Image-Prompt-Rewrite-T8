@@ -21,6 +21,7 @@ from torch.nn.functional import interpolate
 
 
 ROOT = Path(__file__).resolve().parent
+logger = logging.getLogger("qwen_pe")
 DEFAULT_T2I = "Qwen-Image-2.1-PE-T2I.Q4_K_M.gguf"
 DEFAULT_EDIT = "Qwen-Image-2.1-PE-I2I.Q4_K_M.gguf"
 DEFAULT_MMPROJ = "Qwen-Image-2.1-PE-I2I.mmproj-bf16.gguf"
@@ -485,6 +486,27 @@ class LocalServer:
             raise FileNotFoundError("llama-server.exe not found; set QWEN_PE_LLAMA_SERVER")
         return matches[0]
 
+    def _mirror_output(self):
+        """Mirror llama-server's console output to ComfyUI's log and server.log.
+
+        The process prints model load, timing tables and per-request stats; all
+        of it used to land in runtime/server.log where nobody could see it while
+        a rewrite was running.
+        """
+        stream = self.process.stdout if self.process is not None else None
+        if stream is None:
+            return
+        for line in stream:
+            if self.log is not None:
+                try:
+                    self.log.write(line.encode("utf-8", "replace"))
+                    self.log.flush()
+                except OSError:
+                    logging.debug("qwen-pe server log write failed", exc_info=True)
+            text = line.rstrip()
+            if text:
+                logger.info("[llama-server] %s", text)
+
     def stop(self):
         with self.lock:
             try:
@@ -529,7 +551,10 @@ class LocalServer:
             self.log = log_path.open("ab")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             try:
-                self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, creationflags=flags)
+                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                creationflags=flags, text=True, encoding="utf-8",
+                                                errors="replace", bufsize=1)
+                threading.Thread(target=self._mirror_output, name="qwen-pe-log", daemon=True).start()
                 self.profile = profile
                 self.port = port
                 try:
