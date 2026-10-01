@@ -372,7 +372,7 @@ class RuntimeContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "retry without thinking was also truncated") as error:
                 server.complete("t2i", "A blue cat", [], 42, 1)
         self.assertEqual(completion.call_count, 2)
-        self.assertIn("context=24576", str(error.exception))
+        self.assertIn("context=8192", str(error.exception))
         self.assertIn("completion_tokens=16256", str(error.exception))
 
     def test_generic_image_tag_gets_image_count_specific_retry(self):

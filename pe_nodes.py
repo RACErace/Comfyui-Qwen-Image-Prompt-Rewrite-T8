@@ -170,7 +170,12 @@ class QwenPERewrite:
         mmproj = pick_mmproj(model_name, vision_model) if actual_task == "edit" else None
         encoded, dimensions = prepare_images(images)
         image_fingerprints = [hashlib.sha256(value.encode("ascii")).hexdigest() for value in encoded]
-        context = 24576 if not images else (49152 if len(images) <= 5 else 65536)
+        # 49152 was sized for the theoretical maximum edit request. On an 8 GB
+        # card that KV cache does not fit next to the Q4 model, so llama.cpp
+        # pages and generation drops to ~13 tok/s (a short reply measures ~37).
+        # Observed peaks are around 6k tokens, so size for the input plus a long
+        # rewrite instead of the theoretical maximum.
+        context = 8192 if not images else (12288 if len(images) <= 5 else 16384)
         try:
             import comfy.model_management as memory
             memory.free_memory(12 * 1024**3, memory.get_torch_device())
