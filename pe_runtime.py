@@ -280,6 +280,12 @@ def parse_answer(raw, task, image_count):
     required = {"rewritten_prompt", "wh_ratio"} if task == "t2i" else {"rewritten_prompt", "wh_ratio", "ratio_follow"}
     if set(answer) != required:
         raise ValueError(f"wrong answer fields: got {sorted(answer)}, expected {sorted(required)}")
+    # Qwen emits a ratio field either as the string "false" or as a real JSON
+    # false. Both mean "not set", so normalise the boolean before the string
+    # check below rejects the whole answer.
+    for field in ("wh_ratio", "ratio_follow"):
+        if answer.get(field) is False:
+            answer[field] = ""
     if not all(isinstance(value, str) for value in answer.values()):
         raise ValueError("answer fields must all be strings")
     for field in ("wh_ratio", "ratio_follow"):

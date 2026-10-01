@@ -59,6 +59,11 @@ class RuntimeContractTests(unittest.TestCase):
                               "edit", 1)
         self.assertEqual(answer["wh_ratio"], "")
         self.assertEqual(answer["ratio_follow"], "<image1>")
+        # A real JSON false, not the string "false": same meaning.
+        answer = parse_answer('{"rewritten_prompt":"x","wh_ratio":"16:9","ratio_follow":false}',
+                              "edit", 1)
+        self.assertEqual(answer["wh_ratio"], "16:9")
+        self.assertEqual(answer["ratio_follow"], "")
         with self.assertRaises(ValueError):
             parse_answer('{"rewritten_prompt":"x","wh_ratio":"","ratio_follow":""}', "edit", 1)
 
