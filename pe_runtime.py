@@ -28,6 +28,10 @@ DEFAULT_MMPROJ = "Qwen-Image-2.1-PE-I2I.mmproj-bf16.gguf"
 MAX_VISUAL_PIXELS = 1024 * 1024
 MAX_VISUAL_SIDE = 4096
 _RATIO = re.compile(r"^[1-9]\d{0,2}:[1-9]\d{0,2}$")
+# Qwen sometimes writes a JS-style false into a ratio field ("ratio_follow":
+# "false"). Those literals mean "not set"; reading them as a value makes the
+# answer look like it set both ratios and fails an otherwise good rewrite.
+_UNSET_RATIO_VALUES = {"", "false", "none", "null", "no"}
 _HAN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _OTHER_SCRIPT = re.compile(r"[\u0400-\u052f\u0590-\u06ff\u0900-\u097f\u0e00-\u0e7f\u3040-\u30ff\uac00-\ud7af]")
 _QUOTED_LITERAL = re.compile(
@@ -278,6 +282,9 @@ def parse_answer(raw, task, image_count):
         raise ValueError(f"wrong answer fields: got {sorted(answer)}, expected {sorted(required)}")
     if not all(isinstance(value, str) for value in answer.values()):
         raise ValueError("answer fields must all be strings")
+    for field in ("wh_ratio", "ratio_follow"):
+        if field in answer and answer[field].strip().lower() in _UNSET_RATIO_VALUES:
+            answer[field] = ""
     if not answer["rewritten_prompt"].strip():
         raise ValueError("rewritten_prompt is empty")
     ratio = answer["wh_ratio"]
@@ -493,7 +500,8 @@ class LocalServer:
         of it used to land in runtime/server.log where nobody could see it while
         a rewrite was running.
         """
-        stream = self.process.stdout if self.process is not None else None
+        # getattr: tests drive this with a process stand-in that has no pipe.
+        stream = getattr(self.process, "stdout", None)
         if stream is None:
             return
         for line in stream:

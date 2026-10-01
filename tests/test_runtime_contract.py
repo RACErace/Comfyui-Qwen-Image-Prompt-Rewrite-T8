@@ -48,6 +48,20 @@ class RuntimeContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_answer('{"rewritten_prompt":"x","wh_ratio":"1:1","ratio_follow":"<image1>"}', "edit", 1)
 
+    def test_parse_reads_literal_false_as_unset_ratio(self):
+        # Qwen writes a JS-style false into a ratio field while also naming a
+        # ratio; that means "not following an image", not a second ratio.
+        answer = parse_answer('{"rewritten_prompt":"x","wh_ratio":"3:4","ratio_follow":"false"}',
+                              "edit", 1)
+        self.assertEqual(answer["wh_ratio"], "3:4")
+        self.assertEqual(answer["ratio_follow"], "")
+        answer = parse_answer('{"rewritten_prompt":"x","wh_ratio":"None","ratio_follow":"<image1>"}',
+                              "edit", 1)
+        self.assertEqual(answer["wh_ratio"], "")
+        self.assertEqual(answer["ratio_follow"], "<image1>")
+        with self.assertRaises(ValueError):
+            parse_answer('{"rewritten_prompt":"x","wh_ratio":"","ratio_follow":""}', "edit", 1)
+
     def test_reference_contract(self):
         validate_references({"rewritten_prompt": "Use <image1> and <image2>."}, "edit", 2)
         nine_tags = " ".join(f"<image{i}>" for i in range(1, 10))
